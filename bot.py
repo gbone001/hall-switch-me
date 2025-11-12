@@ -630,6 +630,17 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
                 logger.debug(f'Could not notify user about command sync: {delivery_exc}')
         return
 
-    raise error
+    logger.exception('Unhandled slash-command error', exc_info=error)
+    error_text = lang.get(
+        'command_failed',
+        'An error occurred while processing your command. Please try again later.'
+    )
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.send_message(error_text, ephemeral=True)
+        else:
+            await interaction.followup.send(error_text, ephemeral=True)
+    except Exception as delivery_exc:
+        logger.warning(f'Unable to send error notification after command failure: {delivery_exc}')
 
 bot.run(TOKEN)

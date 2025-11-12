@@ -20,7 +20,8 @@
         "players_list_missing_number": "Player number {number} is not cached. Run !{COMMAND_LIST_PLAYERS} again.",
         "players_list_missing_id": "Player number {number} does not expose a usable ID.",
         "switch_invalid_usage": "Use !{COMMAND_SWITCH} <player number> after !{COMMAND_LIST_PLAYERS}.",
-        "command_signature_updated": "Slash commands were refreshed; please try again."
+        "command_signature_updated": "Slash commands were refreshed; please try again.",
+        "command_failed": "An error occurred while processing your command. Please try again later."
     },
     "de": {
         "logged_in": "Angemeldet als {bot_name}",
@@ -43,6 +44,7 @@
         "players_list_missing_number": "Spieler Nummer {number} ist nicht im Cache. Starte !{COMMAND_LIST_PLAYERS} erneut.",
         "players_list_missing_id": "Spieler Nummer {number} hat keine verwertbare ID.",
         "switch_invalid_usage": "Nutze !{COMMAND_SWITCH} <Spieler-Nummer> nach !{COMMAND_LIST_PLAYERS}.",
-        "command_signature_updated": "Die Slash-Befehle wurden aktualisiert; bitte versuche es erneut."
+        "command_signature_updated": "Die Slash-Befehle wurden aktualisiert; bitte versuche es erneut.",
+        "command_failed": "Beim Ausführen deines Befehls ist ein Fehler aufgetreten. Bitte versuche es später erneut."
     }
 }
