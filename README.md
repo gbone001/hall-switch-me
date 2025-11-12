@@ -89,12 +89,13 @@ API_BASE_URLS=https://rcon.example.com,https://rcon2.example.com
 
 * **Switch team:** `!switch`
   The bot finds the CRCON instance where you are currently playing, checks the opposite team’s capacity, and switches you if possible. If the team is full, you’re added to a queue.
-  Use `!switch <number>` right after `!players` to target a specific entry from the most recent list (numbers restart from 1 for each server/team block, so rerun `!players` if the cache is stale).
+  Use `!switch <number>` (or `/switch <number>`) right after listing players to target a specific entry from the most recent list (numbers restart from 1 for each server/team block, so rerun `!players` or `/players` if the cache is stale).
 * **List players:** `!players [axis|allies]`
   Shows who is currently on each configured CRCON. Include `axis` or `allies` to filter a specific team.
-  The response is cached and every player is prefixed with a number; use `!switch <number>` to target that cached player without needing to register your own Steam ID.
+  The response is cached and every player is prefixed with a number; use `!switch <number>` or `/switch <number>` to target that cached player without needing to register your own Steam ID.
 
-> Command keywords are configurable via `.env` (`COMMAND_SWITCH`, `COMMAND_PLAYERS`).
+* **Slash commands:** `/players [axis|allies]` lists the cached rosters just like `!players`, and `/switch <player_number>` triggers the same cached switch workflow; the bot syncs the commands automatically on startup.
+
 
 ---
 

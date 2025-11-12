@@ -2,6 +2,7 @@ import os
 import asyncio
 from dotenv import load_dotenv
 import discord
+from discord import app_commands
 from api_client import APIClient
 import json
 from collections import deque
@@ -9,7 +10,7 @@ import logging
 from logging.handlers import TimedRotatingFileHandler
 import gzip
 import shutil
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Callable, Awaitable, Any
 
 # ---------------------------------------------------------------------
 # .env laden
@@ -161,7 +162,7 @@ def _resolve_player_id_from_pdata(pdata: dict) -> Optional[str]:
 
 async def _attempt_switch_in_rcon(
     client: 'MyBot',
-    channel: discord.abc.Messageable,
+    send_func: Callable[[str], Awaitable[Any]],
     rcon_client: APIClient,
     player_id: str,
     player_name: str,
@@ -169,7 +170,7 @@ async def _attempt_switch_in_rcon(
     requester_discord_id: str,
 ) -> None:
     if not player_team:
-        await channel.send(lang['player_not_in_game'])
+        await send_func(lang['player_not_in_game'])
         logger.info(f'{player_name}: kein Team in Daten.')
         return
 
@@ -183,15 +184,15 @@ async def _attempt_switch_in_rcon(
     if target_team_players < 50:
         response = await client._switch_player_now_async(rcon_client, player_id)
         if response.get('result') is True and not response.get('failed'):
-            await channel.send(lang['switch_request_success'].format(player_name=player_name))
+            await send_func(lang['switch_request_success'].format(player_name=player_name))
             logger.info(f'Switch OK: {player_name}')
         else:
-            await channel.send(lang['switch_request_failure'].format(player_name=player_name))
+            await send_func(lang['switch_request_failure'].format(player_name=player_name))
             logger.warning(f'Switch FAIL: {player_name}')
     else:
         MAX_QUEUE_SIZE = 10
         if len(switch_queue) >= MAX_QUEUE_SIZE:
-            await channel.send(lang['queue_full'])
+            await send_func(lang['queue_full'])
             logger.info('Warteschlange voll.')
         else:
             switch_queue.append({
@@ -200,11 +201,88 @@ async def _attempt_switch_in_rcon(
                 'target_team': target_team,
                 'discord_id': requester_discord_id,
             })
-            await channel.send(lang['added_to_queue'].format(
+            await send_func(lang['added_to_queue'].format(
                 player_name=player_name,
                 target_team=target_team.capitalize()
             ))
             logger.info(f'In Queue: {player_name} -> {target_team}')
+
+
+async def _handle_players_list(
+    client: 'MyBot',
+    send_func: Callable[[str], Awaitable[Any]],
+    filter_arg: str,
+) -> None:
+    if filter_arg in ('axis', 'allies'):
+        team_filter = filter_arg
+        team_label = lang.get(f'team_{team_filter}', team_filter.capitalize())
+    elif not filter_arg or filter_arg in ('all', 'both'):
+        team_filter = None
+        team_label = lang.get('team_all', 'All teams')
+    else:
+        await send_func(lang.get(
+            'invalid_team_filter',
+            'Filter must be axis or allies (e.g., !{COMMAND_LIST_PLAYERS} axis).'
+        ).format(COMMAND_LIST_PLAYERS=COMMAND_LIST_PLAYERS))
+        return
+
+    if not client.api_clients:
+        await send_func(lang.get('rcon_not_configured', 'RCON is not configured.'))
+        return
+
+    player_list_cache['entries'] = {}
+    current_index = 0
+
+    for api_client in client.api_clients:
+        server_name = getattr(api_client, '_rcon_name', 'unknown')
+        try:
+            players_response = await client._get_detailed_players_async(api_client)
+        except Exception as exc:
+            await send_func(lang.get(
+                'players_list_failure',
+                'Failed to fetch players from {server_name}: {error}'
+            ).format(server_name=server_name, error=str(exc)))
+            continue
+
+        players_map = _extract_players_map(players_response)
+        filtered_players = []
+        for pdata in players_map.values():
+            if not isinstance(pdata, dict):
+                continue
+            pdata_team = _normalize_team(pdata.get('team', ''))
+            if team_filter and pdata_team != team_filter:
+                continue
+            player_id = _resolve_player_id_from_pdata(pdata) or ''
+            display_name = _format_player_display_name(pdata)
+            if not display_name:
+                continue
+
+            current_index += 1
+            player_list_cache['entries'][current_index] = {
+                'api_client': api_client,
+                'player_id': player_id,
+                'player_name': display_name,
+                'team': pdata_team,
+                'server_name': server_name,
+            }
+            filtered_players.append((current_index, display_name))
+
+        header = lang.get(
+            'players_list_header',
+            '{server_name} – {team_label} ({count} players)'
+        ).format(server_name=server_name, team_label=team_label, count=len(filtered_players))
+
+        if filtered_players:
+            lines = [header] + [f"{idx}. {name}" for idx, name in filtered_players]
+        else:
+            lines = [
+                header,
+                lang.get(
+                    'players_list_empty',
+                    'No players on {server_name} ({team_label}).'
+                ).format(server_name=server_name, team_label=team_label)
+            ]
+        await send_func('\n'.join(lines))
 
 # ---------------------------------------------------------------------
 # Bot-Klasse
@@ -213,6 +291,7 @@ class MyBot(discord.Client):
     def __init__(self, intents):
         super().__init__(intents=intents)
         self.api_clients: List[APIClient] = self._load_rcons()
+        self.tree = app_commands.CommandTree(self)
         logger.debug(f'Bot-Instanz initialisiert. RCON-Clients: {len(self.api_clients)}')
 
     def _load_rcons(self) -> List[APIClient]:
@@ -279,8 +358,68 @@ class MyBot(discord.Client):
             logger.error("Keine RCON-Konfiguration gefunden. Bitte .env prüfen.")
         return clients
 
+    @app_commands.command(name='players')
+    @app_commands.describe(team='Filter axis or allies')
+    @app_commands.choices(team=[
+        app_commands.Choice(name='All', value='all'),
+        app_commands.Choice(name='Axis', value='axis'),
+        app_commands.Choice(name='Allies', value='allies'),
+    ])
+    async def players_command(
+        self,
+        interaction: discord.Interaction,
+        team: app_commands.Choice[str] | None = None,
+    ):
+        filter_arg = team.value if team else ''
+        await interaction.response.defer()
+
+        async def send_block(text: str):
+            await interaction.followup.send(content=text)
+
+        await _handle_players_list(self, send_block, filter_arg)
+
+    @app_commands.command(name='switch')
+    @app_commands.describe(player_number='Number from the latest /players response')
+    async def switch_command(
+        self,
+        interaction: discord.Interaction,
+        player_number: int,
+    ):
+        await interaction.response.defer()
+
+        entry = player_list_cache['entries'].get(player_number)
+        if not entry:
+            await interaction.followup.send(lang['players_list_missing_number'].format(
+                number=player_number,
+                COMMAND_LIST_PLAYERS=COMMAND_LIST_PLAYERS,
+            ))
+            return
+
+        player_id = entry.get('player_id')
+        if not player_id:
+            await interaction.followup.send(lang['players_list_missing_id'].format(
+                number=player_number
+            ))
+            return
+
+        async def send_block(text: str):
+            await interaction.followup.send(content=text)
+
+        await _attempt_switch_in_rcon(
+            self,
+            send_block,
+            entry['api_client'],
+            player_id,
+            entry.get('player_name', player_id),
+            entry.get('team', ''),
+            str(interaction.user.id),
+        )
+
     async def setup_hook(self):
         self.loop.create_task(self.process_switch_queue())
+        self.tree.add_command(self.players_command)
+        self.tree.add_command(self.switch_command)
+        await self.tree.sync()
 
     async def on_ready(self):
         logger.info(lang['logged_in'].format(bot_name=self.user))
@@ -396,121 +535,40 @@ async def handle_command(client: MyBot, message: discord.Message):
             number = int(parts[1])
             entry = player_list_cache['entries'].get(number)
             if not entry:
-                await message.channel.send(lang.get(
-                    'players_list_missing_number',
-                    'Player number {number} is not cached. Run !{COMMAND_LIST_PLAYERS} again.'
-                ).format(
+                await message.channel.send(lang['players_list_missing_number'].format(
                     number=number,
-                    COMMAND_LIST_PLAYERS=COMMAND_LIST_PLAYERS
+                    COMMAND_LIST_PLAYERS=COMMAND_LIST_PLAYERS,
                 ))
                 return
 
             player_id = entry.get('player_id')
             if not player_id:
-                await message.channel.send(lang.get(
-                    'players_list_missing_id',
-                    'Player number {number} does not expose a usable ID.'
-                ).format(number=number))
+                await message.channel.send(lang['players_list_missing_id'].format(number=number))
                 return
 
             await _attempt_switch_in_rcon(
                 client,
-                message.channel,
+                message.channel.send,
                 entry['api_client'],
                 player_id,
                 entry.get('player_name', player_id),
                 entry.get('team', ''),
-                str(message.author.id)
+                str(message.author.id),
             )
         else:
-            await message.channel.send(lang.get(
-                'switch_invalid_usage',
-                'Use !{COMMAND_SWITCH} <player number> after !{COMMAND_LIST_PLAYERS}.'
-            ).format(
+            await message.channel.send(lang['switch_invalid_usage'].format(
                 COMMAND_SWITCH=COMMAND_SWITCH,
-                COMMAND_LIST_PLAYERS=COMMAND_LIST_PLAYERS
+                COMMAND_LIST_PLAYERS=COMMAND_LIST_PLAYERS,
             ))
             logger.warning(f'Unbekannter Befehl/Parameter: {message.author}: {message.content}')
 
     elif content.startswith(f'!{COMMAND_LIST_PLAYERS}'):
         parts = content.split()
         filter_arg = parts[1].lower() if len(parts) > 1 else ''
-        if filter_arg in ('axis', 'allies'):
-            team_filter = filter_arg
-            team_label = lang.get(f'team_{team_filter}', team_filter.capitalize())
-        elif not filter_arg or filter_arg in ('all', 'both'):
-            team_filter = None
-            team_label = lang.get('team_all', 'All teams')
-        else:
-            await message.channel.send(lang.get(
-                'invalid_team_filter',
-                'Filter must be axis or allies (e.g., !{COMMAND_LIST_PLAYERS} axis).'
-            ).format(COMMAND_LIST_PLAYERS=COMMAND_LIST_PLAYERS))
-            return
-
-        if not client.api_clients:
-            await message.channel.send(lang.get('rcon_not_configured', 'RCON is not configured.'))
-            return
-
-        player_list_cache['entries'] = {}
-        current_index = 0
-
-        for api_client in client.api_clients:
-            server_name = getattr(api_client, '_rcon_name', 'unknown')
-            try:
-                players_response = await client._get_detailed_players_async(api_client)
-            except Exception as exc:
-                await message.channel.send(lang.get(
-                    'players_list_failure',
-                    'Failed to fetch players from {server_name}: {error}'
-                ).format(server_name=server_name, error=str(exc)))
-                continue
-
-            players_map = _extract_players_map(players_response)
-            filtered_players = []
-            for pdata in players_map.values():
-                if not isinstance(pdata, dict):
-                    continue
-                pdata_team = _normalize_team(pdata.get('team', ''))
-                if team_filter and pdata_team != team_filter:
-                    continue
-                player_id = _resolve_player_id_from_pdata(pdata) or ''
-                display_name = _format_player_display_name(pdata)
-                if not display_name:
-                    continue
-
-                current_index += 1
-                player_list_cache['entries'][current_index] = {
-                    'api_client': api_client,
-                    'player_id': player_id,
-                    'player_name': display_name,
-                    'team': pdata_team,
-                    'server_name': server_name,
-                }
-                filtered_players.append((current_index, display_name))
-
-            header = lang.get(
-                'players_list_header',
-                '{server_name} - {team_label} ({count} players)'
-            ).format(server_name=server_name, team_label=team_label, count=len(filtered_players))
-
-            if filtered_players:
-                lines = [header] + [f"{idx}. {name}" for idx, name in filtered_players]
-            else:
-                lines = [
-                    header,
-                    lang.get(
-                        'players_list_empty',
-                        'No players on {server_name} ({team_label}).'
-                    ).format(server_name=server_name, team_label=team_label)
-                ]
-            await message.channel.send('\n'.join(lines))
+        await _handle_players_list(client, message.channel.send, filter_arg)
 
     else:
-        await message.channel.send(lang['unknown_command'].format(
-            COMMAND_LIST_PLAYERS=COMMAND_LIST_PLAYERS,
-            COMMAND_SWITCH=COMMAND_SWITCH
-        ))
+        await message.channel.send(lang['unknown_command'])
         logger.warning(f'Unbekannter Befehl: {message.author}: {message.content}')
 # ---------------------------------------------------------------------
 # Start
