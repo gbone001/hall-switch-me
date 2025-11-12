@@ -3,8 +3,6 @@ import asyncio
 from dotenv import load_dotenv
 import discord
 from api_client import APIClient
-from database import Database
-from utils import is_valid_steam_id
 import json
 from collections import deque
 import logging
@@ -21,10 +19,9 @@ load_dotenv()
 # Discord / App-Konfiguration
 TOKEN = os.getenv('DISCORD_BOT_TOKEN', '')
 ALLOWED_CHANNEL_ID = os.getenv('ALLOWED_CHANNEL_ID', '')
-DB_FILE = os.getenv('DB_FILE', 'bot.db')
 LANGUAGE = os.getenv('LANGUAGE', 'en')
 COMMAND_SWITCH = os.getenv('COMMAND_SWITCH', 'switch')
-COMMAND_REG = os.getenv('COMMAND_REG', 'reg')
+COMMAND_LIST_PLAYERS = os.getenv('COMMAND_PLAYERS', 'players')
 
 # RCON-Konfiguration
 # Gemeinsamer Token für alle RCONs
@@ -89,9 +86,10 @@ intents.messages = True
 intents.message_content = True
 
 # ---------------------------------------------------------------------
-# Globale Warteschlange (player_id = Steam64)
+# Global players cache + queue (player_id = Steam64)
 # ---------------------------------------------------------------------
 switch_queue = deque()
+player_list_cache = {'entries': {}}
 
 # ---------------------------------------------------------------------
 # Helpers
@@ -127,13 +125,93 @@ def _find_player_by_id_or_name(players_map: dict, player_id: str, player_name: O
 
     return None, None
 
+
+def _normalize_team(team_value: str) -> str:
+    normalized = str(team_value or '').strip().lower()
+    if normalized.startswith('axis'):
+        return 'axis'
+    if normalized.startswith('all') or normalized.startswith('ally'):
+        return 'allies'
+    return normalized
+
+
+def _format_player_display_name(pdata: dict) -> str:
+    if not isinstance(pdata, dict):
+        return 'unknown'
+    for key in ('name', 'player_name', 'nickname', 'personaname', 'player_id', 'steam_id_64', 'id'):
+        value = pdata.get(key)
+        if value:
+            text = str(value).strip()
+            if text:
+                return text
+    return 'unknown'
+
+
+def _resolve_player_id_from_pdata(pdata: dict) -> Optional[str]:
+    if not isinstance(pdata, dict):
+        return None
+    for key in ('steam_id_64', 'player_id', 'id', 'steam_id'):
+        value = pdata.get(key)
+        if value:
+            candidate = str(value).strip()
+            if candidate:
+                return candidate
+    return None
+
+
+async def _attempt_switch_in_rcon(
+    client: 'MyBot',
+    channel: discord.abc.Messageable,
+    rcon_client: APIClient,
+    player_id: str,
+    player_name: str,
+    player_team: str,
+    requester_discord_id: str,
+) -> None:
+    if not player_team:
+        await channel.send(lang['player_not_in_game'])
+        logger.info(f'{player_name}: kein Team in Daten.')
+        return
+
+    target_team = 'axis' if player_team == 'allies' else 'allies'
+    gamestate = await client._get_gamestate_async(rcon_client)
+    res = gamestate.get('result', {}) if isinstance(gamestate, dict) else {}
+    num_allied_players = int(res.get('num_allied_players', 0))
+    num_axis_players = int(res.get('num_axis_players', 0))
+    target_team_players = num_axis_players if target_team == 'axis' else num_allied_players
+
+    if target_team_players < 50:
+        response = await client._switch_player_now_async(rcon_client, player_id)
+        if response.get('result') is True and not response.get('failed'):
+            await channel.send(lang['switch_request_success'].format(player_name=player_name))
+            logger.info(f'Switch OK: {player_name}')
+        else:
+            await channel.send(lang['switch_request_failure'].format(player_name=player_name))
+            logger.warning(f'Switch FAIL: {player_name}')
+    else:
+        MAX_QUEUE_SIZE = 10
+        if len(switch_queue) >= MAX_QUEUE_SIZE:
+            await channel.send(lang['queue_full'])
+            logger.info('Warteschlange voll.')
+        else:
+            switch_queue.append({
+                'player_id': player_id,
+                'player_name': player_name,
+                'target_team': target_team,
+                'discord_id': requester_discord_id,
+            })
+            await channel.send(lang['added_to_queue'].format(
+                player_name=player_name,
+                target_team=target_team.capitalize()
+            ))
+            logger.info(f'In Queue: {player_name} -> {target_team}')
+
 # ---------------------------------------------------------------------
 # Bot-Klasse
 # ---------------------------------------------------------------------
 class MyBot(discord.Client):
     def __init__(self, intents):
         super().__init__(intents=intents)
-        self.db = Database(DB_FILE)
         self.api_clients: List[APIClient] = self._load_rcons()
         logger.debug(f'Bot-Instanz initialisiert. RCON-Clients: {len(self.api_clients)}')
 
@@ -312,105 +390,128 @@ class MyBot(discord.Client):
 async def handle_command(client: MyBot, message: discord.Message):
     content = message.content.strip()
 
-    if content.startswith(f'!{COMMAND_REG}'):
+    if content.startswith(f'!{COMMAND_SWITCH}'):
         parts = content.split()
-        if len(parts) == 2 and is_valid_steam_id(parts[1]):
-            steam_id = parts[1]
-            logger.debug(f'Registrierungsanfrage von {message.author} mit Steam-ID {steam_id}')
-
-            api_for_profile = client.api_clients[0] if client.api_clients else None
-            if not api_for_profile:
-                await message.channel.send("RCON ist nicht konfiguriert.")
+        if len(parts) == 2 and parts[1].isdigit():
+            number = int(parts[1])
+            entry = player_list_cache['entries'].get(number)
+            if not entry:
+                await message.channel.send(lang.get(
+                    'players_list_missing_number',
+                    'Player number {number} is not cached. Run !{COMMAND_LIST_PLAYERS} again.'
+                ).format(
+                    number=number,
+                    COMMAND_LIST_PLAYERS=COMMAND_LIST_PLAYERS
+                ))
                 return
 
-            player_info = await asyncio.to_thread(api_for_profile.get_player_profile, steam_id)
-            if (isinstance(player_info, dict)
-                and not player_info.get('failed')
-                and 'result' in player_info
-                and player_info['result'].get('names')):
+            player_id = entry.get('player_id')
+            if not player_id:
+                await message.channel.send(lang.get(
+                    'players_list_missing_id',
+                    'Player number {number} does not expose a usable ID.'
+                ).format(number=number))
+                return
 
-                player_name = player_info['result']['names'][0].get('name', steam_id)
-                if client.db.add_user_with_name(message.author.id, steam_id, player_name):
-                    await message.channel.send(lang['register_success'].format(
-                        player_name=player_name,
-                        steam_id=steam_id,
-                        user_mention=message.author.mention
-                    ))
-                    logger.info(f'Registriert: {message.author} als {player_name} ({steam_id}).')
-                else:
-                    await message.channel.send(lang['register_failure'].format(steam_id=steam_id))
-                    logger.warning(f'Registrierung bereits vorhanden/aktualisiert: {message.author} ({steam_id}).')
-            else:
-                await message.channel.send(lang['fetch_failure'].format(steam_id=steam_id))
-                logger.warning(f'Profil für {steam_id} nicht abrufbar.')
+            await _attempt_switch_in_rcon(
+                client,
+                message.channel,
+                entry['api_client'],
+                player_id,
+                entry.get('player_name', player_id),
+                entry.get('team', ''),
+                str(message.author.id)
+            )
         else:
-            await message.channel.send(lang['invalid_steam_id'])
-            logger.warning(f'Ungültige Steam-ID von {message.author}: {message.content}')
+            await message.channel.send(lang.get(
+                'switch_invalid_usage',
+                'Use !{COMMAND_SWITCH} <player number> after !{COMMAND_LIST_PLAYERS}.'
+            ).format(
+                COMMAND_SWITCH=COMMAND_SWITCH,
+                COMMAND_LIST_PLAYERS=COMMAND_LIST_PLAYERS
+            ))
+            logger.warning(f'Unbekannter Befehl/Parameter: {message.author}: {message.content}')
 
-    elif content.startswith(f'!{COMMAND_SWITCH}'):
-        discord_id = str(message.author.id)
-        steam_id, player_name = client.db.get_steam_id_and_name(discord_id)
-
-        if steam_id is None:
-            await message.channel.send(lang['not_registered'].format(COMMAND_REG=COMMAND_REG))
-            logger.info(f'Nicht registriert: {message.author}.')
-            return
-
-        logger.debug(f'Switch-Anfrage: {message.author} für {player_name} ({steam_id})')
-
-        rcon_client, found_id, pdata = await client._find_player_across_rcons(steam_id, player_name)
-        if not rcon_client or not found_id or not isinstance(pdata, dict):
-            await message.channel.send(lang['player_not_in_game'])
-            logger.info(f'{player_name} ist nicht im Spiel.')
-            return
-
-        player_team = str(pdata.get('team', '')).lower()
-        if not player_team:
-            await message.channel.send(lang['player_not_in_game'])
-            logger.info(f'{player_name}: kein Team in Daten.')
-            return
-
-        target_team = 'axis' if player_team == 'allies' else 'allies'
-
-        gamestate = await client._get_gamestate_async(rcon_client)
-        res = gamestate.get('result', {}) if isinstance(gamestate, dict) else {}
-        num_allied_players = int(res.get('num_allied_players', 0))
-        num_axis_players = int(res.get('num_axis_players', 0))
-        target_team_players = num_axis_players if target_team == 'axis' else num_allied_players
-
-        if target_team_players < 50:
-            response = await client._switch_player_now_async(rcon_client, steam_id)
-            if response.get('result') is True and not response.get('failed'):
-                await message.channel.send(lang['switch_request_success'].format(player_name=player_name or steam_id))
-                logger.info(f'Switch OK: {player_name or steam_id}')
-            else:
-                await message.channel.send(lang['switch_request_failure'].format(player_name=player_name or steam_id))
-                logger.warning(f'Switch FAIL: {player_name or steam_id}')
+    elif content.startswith(f'!{COMMAND_LIST_PLAYERS}'):
+        parts = content.split()
+        filter_arg = parts[1].lower() if len(parts) > 1 else ''
+        if filter_arg in ('axis', 'allies'):
+            team_filter = filter_arg
+            team_label = lang.get(f'team_{team_filter}', team_filter.capitalize())
+        elif not filter_arg or filter_arg in ('all', 'both'):
+            team_filter = None
+            team_label = lang.get('team_all', 'All teams')
         else:
-            MAX_QUEUE_SIZE = 10
-            if len(switch_queue) >= MAX_QUEUE_SIZE:
-                await message.channel.send(lang['queue_full'])
-                logger.info('Warteschlange voll.')
+            await message.channel.send(lang.get(
+                'invalid_team_filter',
+                'Filter must be axis or allies (e.g., !{COMMAND_LIST_PLAYERS} axis).'
+            ).format(COMMAND_LIST_PLAYERS=COMMAND_LIST_PLAYERS))
+            return
+
+        if not client.api_clients:
+            await message.channel.send(lang.get('rcon_not_configured', 'RCON is not configured.'))
+            return
+
+        player_list_cache['entries'] = {}
+        current_index = 0
+
+        for api_client in client.api_clients:
+            server_name = getattr(api_client, '_rcon_name', 'unknown')
+            try:
+                players_response = await client._get_detailed_players_async(api_client)
+            except Exception as exc:
+                await message.channel.send(lang.get(
+                    'players_list_failure',
+                    'Failed to fetch players from {server_name}: {error}'
+                ).format(server_name=server_name, error=str(exc)))
+                continue
+
+            players_map = _extract_players_map(players_response)
+            filtered_players = []
+            for pdata in players_map.values():
+                if not isinstance(pdata, dict):
+                    continue
+                pdata_team = _normalize_team(pdata.get('team', ''))
+                if team_filter and pdata_team != team_filter:
+                    continue
+                player_id = _resolve_player_id_from_pdata(pdata) or ''
+                display_name = _format_player_display_name(pdata)
+                if not display_name:
+                    continue
+
+                current_index += 1
+                player_list_cache['entries'][current_index] = {
+                    'api_client': api_client,
+                    'player_id': player_id,
+                    'player_name': display_name,
+                    'team': pdata_team,
+                    'server_name': server_name,
+                }
+                filtered_players.append((current_index, display_name))
+
+            header = lang.get(
+                'players_list_header',
+                '{server_name} - {team_label} ({count} players)'
+            ).format(server_name=server_name, team_label=team_label, count=len(filtered_players))
+
+            if filtered_players:
+                lines = [header] + [f"{idx}. {name}" for idx, name in filtered_players]
             else:
-                switch_queue.append({
-                    'player_id': steam_id,
-                    'player_name': player_name,
-                    'target_team': target_team,
-                    'discord_id': discord_id,
-                })
-                await message.channel.send(lang['added_to_queue'].format(
-                    player_name=player_name or steam_id,
-                    target_team=target_team.capitalize()
-                ))
-                logger.info(f'In Queue: {player_name or steam_id} -> {target_team}')
+                lines = [
+                    header,
+                    lang.get(
+                        'players_list_empty',
+                        'No players on {server_name} ({team_label}).'
+                    ).format(server_name=server_name, team_label=team_label)
+                ]
+            await message.channel.send('\n'.join(lines))
 
     else:
         await message.channel.send(lang['unknown_command'].format(
-            COMMAND_REG=COMMAND_REG,
+            COMMAND_LIST_PLAYERS=COMMAND_LIST_PLAYERS,
             COMMAND_SWITCH=COMMAND_SWITCH
         ))
         logger.warning(f'Unbekannter Befehl: {message.author}: {message.content}')
-
 # ---------------------------------------------------------------------
 # Start
 # ---------------------------------------------------------------------
