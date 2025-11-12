@@ -424,6 +424,7 @@ class MyBot(discord.Client):
     async def on_ready(self):
         logger.info(lang['logged_in'].format(bot_name=self.user))
         logger.info(lang.get('api_initialized', 'API initialized.'))
+        await self._sync_commands_for_allowed_channel()
 
     async def on_message(self, message: discord.Message):
         try:
@@ -523,6 +524,35 @@ class MyBot(discord.Client):
                     switch_queue.popleft()
             await asyncio.sleep(10)
 
+    async def _sync_commands_for_guild(self, guild) -> None:
+        if not guild:
+            return
+        guild_id = getattr(guild, 'id', None)
+        try:
+            await self.tree.sync(guild=guild)
+            logger.info(f'Synced slash commands for guild {guild_id}.')
+        except Exception as exc:
+            logger.warning(f'Failed to sync slash commands for guild {guild_id}: {exc}')
+
+    async def _sync_commands_for_allowed_channel(self) -> None:
+        if not ALLOWED_CHANNEL_ID:
+            return
+        try:
+            channel_id = int(ALLOWED_CHANNEL_ID)
+        except ValueError:
+            logger.warning('ALLOWED_CHANNEL_ID is invalid; skipping slash-command sync for the guild.')
+            return
+
+        channel = self.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await self.fetch_channel(channel_id)
+            except Exception as exc:
+                logger.debug(f'Failed fetching allowed channel for command sync: {exc}')
+                return
+
+        await self._sync_commands_for_guild(getattr(channel, 'guild', None))
+
 # ---------------------------------------------------------------------
 # Command-Handler
 # ---------------------------------------------------------------------
@@ -574,4 +604,32 @@ async def handle_command(client: MyBot, message: discord.Message):
 # Start
 # ---------------------------------------------------------------------
 bot = MyBot(intents=intents)
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CommandSignatureMismatch):
+        logger.warning('Slash command signature mismatch detected; syncing commands.')
+        guild = interaction.guild
+        if guild:
+            await bot._sync_commands_for_guild(guild)
+        else:
+            try:
+                await bot.tree.sync()
+            except Exception as exc:
+                logger.warning(f'Failed to sync slash commands after signature mismatch: {exc}')
+        if not interaction.response.is_done():
+            try:
+                await interaction.response.send_message(
+                    lang.get(
+                        'command_signature_updated',
+                        'Slash commands were refreshed; please try again.'
+                    ),
+                    ephemeral=True,
+                )
+            except Exception as delivery_exc:
+                logger.debug(f'Could not notify user about command sync: {delivery_exc}')
+        return
+
+    raise error
+
 bot.run(TOKEN)
