@@ -1,5 +1,3 @@
-requests
-python-dotenv
-discord.py
-api-client
-utils
+discord.py>=2.3.3
+python-dotenv>=1.0
+requests>=2.31

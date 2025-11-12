@@ -36,6 +36,16 @@ cp default.env .env   # if you have a template; otherwise create .env as below
 python bot.py
 ```
 
+## Deploying on Railway
+
+1. Create a Railway project pointing to this repository. Railway respects the added `Procfile` (`worker: python bot.py`) and uses `runtime.txt` to pin `python-3.11`, so the bot starts automatically once the build succeeds.
+2. Add the usual configuration that would go into `.env`:
+   - `DISCORD_BOT_TOKEN`, `ALLOWED_CHANNEL_ID`, `API_TOKEN`
+   - `API_BASE_URLS` (comma-separated list or JSON array) or, for legacy cases, `API_BASE_URL`
+   - `DB_FILE` (default `switch.db` lives in the repo root) plus any overrides for `LANGUAGE`, `COMMAND_SWITCH`, `COMMAND_REG`, `RCONS`
+3. Railway runs `pip install -r requirements.txt` during the build step before launching the worker so you only need to redeploy after changing the config; runtime logs are streamed to Railway's console because `bot.py` auto-creates `logs/`.
+4. SQLite persists inside the project directory on Railway; attach an external storage plugin or database if you need longer-lived data, and point `DB_FILE` accordingly.
+
 ---
 
 ## Configuration (.env)
